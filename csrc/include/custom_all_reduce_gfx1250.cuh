@@ -53,6 +53,17 @@
 #define DINLINE __device__ __forceinline__
 #endif
 
+#define DISPATCH_NGPUS_1250(ws, CALL) \
+    switch(ws) {                      \
+        case 2: CALL(2); break;       \
+        case 4: CALL(4); break;       \
+        case 6: CALL(6); break;       \
+        case 8: CALL(8); break;       \
+        default:                      \
+            throw std::runtime_error( \
+                "gfx1250 custom_ar: unsupported world_size " + std::to_string(ws)); \
+    }
+
 namespace aiter {
 
 // ---------------------------------------------------------------------------
@@ -110,10 +121,10 @@ DINLINE opus::fp32_t downcast_s<opus::fp32_t>(opus::fp32_t val)
 // gfx1250 AR supports world_size <= 4; size scratch for the max.
 constexpr int    kLLMaxRanks       = 4;
 // Route to LL when bytes <= this (matches RCCL DDA_ALLREDUCE_LL_THRESHOLD).
-constexpr size_t kLLArMaxBytes     = 131072;            // 128 KiB
+constexpr size_t kLLArMaxBytes     = 4194304;           // 4 MiB
 // Hard per-message payload cap (one slot). Comfortably above the routing
 // threshold so all dtypes at <=128 KiB fit.
-constexpr size_t kLLScratchCapBytes = 262144;           // 256 KiB
+constexpr size_t kLLScratchCapBytes = 4194304;          // 4 MiB
 // Per-rank staging slot capacity, in 8-byte packets.
 constexpr size_t kLLPackCapacity   = kLLScratchCapBytes / 8;  // 32768
 
@@ -219,7 +230,7 @@ DINLINE void ll_load_b128(
 // double-buffered (bank = epoch & 1); the per-epoch flag disambiguates stale
 // lines, so no clearing is needed and it survives CUDA-graph replay.
 template <typename T, int ngpus>
-__global__ void __launch_bounds__(256, 2) ar_ll_gfx1250(
+__global__ void __launch_bounds__(512, 1) ar_ll_gfx1250(
     T* const* __restrict__ peer_scratch, // ngpus scratch bases (device table)
     T* __restrict__ recvbuff,
     const T* __restrict__ sendbuff,
@@ -1082,18 +1093,17 @@ public:
         const size_t bytes = (size_t)numel * sizeof(T);
         const size_t nPk   = bytes >> 3; // 8 payload bytes per packet
 
-        constexpr int threads = 256;
+        const int threads = (bytes < 65536) ? 512 : 256;
         int blocks = std::min<int>(kMaxBlocks, (int)((nPk + threads - 1) / threads));
         if(blocks < 1)
             blocks = 1;
 
         T* const* peers = reinterpret_cast<T* const*>(d_ll_peers_);
-        if(world_size_ == 2)
-            ar_ll_gfx1250<T, 2><<<blocks, threads, 0, stream>>>(
-                peers, output, input, nPk, rank_, d_ll_block_flags_);
-        else
-            ar_ll_gfx1250<T, 4><<<blocks, threads, 0, stream>>>(
-                peers, output, input, nPk, rank_, d_ll_block_flags_);
+#define LAUNCH_LL(NG) \
+        ar_ll_gfx1250<T, NG><<<blocks, threads, 0, stream>>>( \
+            peers, output, input, nPk, rank_, d_ll_block_flags_)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_LL);
+#undef LAUNCH_LL
     }
 
     // gfx1250: return raw device pointers (no hipIpc handles).
@@ -1273,12 +1283,11 @@ public:
         constexpr int threads = 512;
         int blocks = std::min(kMaxBlocks,
                               (size + threads - 1) / threads);
-        if(world_size_ == 2)
-            ag_gfx1250_scalar<T, 2><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size);
-        else
-            ag_gfx1250_scalar<T, 4><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size);
+#define LAUNCH_AG_SCALAR(NG) \
+        ag_gfx1250_scalar<T, NG><<<blocks, threads, 0, stream>>>( \
+            input_ptrs, sg_, self_sg_, output, rank_, size)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_SCALAR);
+#undef LAUNCH_AG_SCALAR
     }
 
     template <typename T>
@@ -1298,12 +1307,11 @@ public:
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
                               (size + threads - 1) / threads);
-        if(world_size_ == 2)
-            ag_gfx1250_naive_vec<T, 2><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size);
-        else
-            ag_gfx1250_naive_vec<T, 4><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size);
+#define LAUNCH_AG_VEC(NG) \
+        ag_gfx1250_naive_vec<T, NG><<<blocks, threads, 0, stream>>>( \
+            input_ptrs, sg_, self_sg_, output, rank_, size)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_VEC);
+#undef LAUNCH_AG_VEC
     }
 
     template <typename T>
@@ -1323,12 +1331,11 @@ public:
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
                               (size + threads * 4 - 1) / (threads * 4));
-        if(world_size_ == 2)
-            ag_gfx1250_naive_unroll4<T, 2><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size);
-        else
-            ag_gfx1250_naive_unroll4<T, 4><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size);
+#define LAUNCH_AG_NAIVE(NG) \
+        ag_gfx1250_naive_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
+            input_ptrs, sg_, self_sg_, output, rank_, size)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_NAIVE);
+#undef LAUNCH_AG_NAIVE
     }
 
     template <typename T>
@@ -1348,12 +1355,11 @@ public:
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
                               (size + threads * 4 - 1) / (threads * 4));
-        if(world_size_ == 2)
-            ag_gfx1250_warpsplit_unroll4<T, 2><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size);
-        else
-            ag_gfx1250_warpsplit_unroll4<T, 4><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size);
+#define LAUNCH_AG_WARP(NG) \
+        ag_gfx1250_warpsplit_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
+            input_ptrs, sg_, self_sg_, output, rank_, size)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_WARP);
+#undef LAUNCH_AG_WARP
     }
 
     template <typename T>
@@ -1376,12 +1382,11 @@ public:
         constexpr int unroll  = 4;
         int blocks = std::min(kMaxBlocks,
                               (size + threads * unroll - 1) / (threads * unroll));
-        if(world_size_ == 2)
-            ag_gfx1250_lastdim<T, 2><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
-        else
-            ag_gfx1250_lastdim<T, 4><<<blocks, threads, 0, stream>>>(
-                input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size);
+#define LAUNCH_AG_LAST(NG) \
+        ag_gfx1250_lastdim<T, NG><<<blocks, threads, 0, stream>>>( \
+            input_ptrs, sg_, self_sg_, output, rank_, size, last_dim_size)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AG_LAST);
+#undef LAUNCH_AG_LAST
     }
 
     template <typename T, int unroll>
@@ -1423,7 +1428,7 @@ public:
         // needed, so branch before get_buffer_RD.
         const size_t bytes = (size_t)size * sizeof(T);
         if(ll_enabled() && bytes <= kLLArMaxBytes &&
-           (world_size_ == 2 || world_size_ == 4))
+           world_size_ <= 8)
         {
             allreduce_ll<T>(stream, input, output, size);
             return;
@@ -1436,24 +1441,14 @@ public:
 
         size /= d;
 
-        if(world_size_ > 4)
-            throw std::runtime_error(
-                "gfx1250 custom allreduce only supports world_size <= 4, got " +
-                std::to_string(world_size_));
-
         constexpr int threads = 256;
         int blocks = std::min(kMaxBlocks,
                               (size + threads * 4 - 1) / (threads * 4));
-        if(world_size_ == 2)
-        {
-            ar_gfx1250_naive_unroll4<T, 2><<<blocks, threads, 0, stream>>>(
-                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);
-        }
-        else
-        {
-            ar_gfx1250_naive_unroll4<T, 4><<<blocks, threads, 0, stream>>>(
-                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);
-        }
+#define LAUNCH_AR(NG) \
+        ar_gfx1250_naive_unroll4<T, NG><<<blocks, threads, 0, stream>>>( \
+            input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size)
+        DISPATCH_NGPUS_1250(world_size_, LAUNCH_AR);
+#undef LAUNCH_AR
     }
 
     template <typename T>
@@ -1471,12 +1466,11 @@ public:
             int range = k / (world_size_ * pack_size);
             dim3 block(512);
             dim3 grid(std::min(kGridCap, (range + 511) / 512));
-            if(world_size_ == 2)
-                rs_gfx1250_split_first_dim<T, 2>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
-            else
-                rs_gfx1250_split_first_dim<T, 4>
-                    <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range);
+#define LAUNCH_RS_FIRST(NG) \
+            rs_gfx1250_split_first_dim<T, NG> \
+                <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output, rank_, range)
+            DISPATCH_NGPUS_1250(world_size_, LAUNCH_RS_FIRST);
+#undef LAUNCH_RS_FIRST
             break;
         }
         case ReduceScatterSplitDim::kLast: {
@@ -1496,8 +1490,7 @@ public:
                 <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output,       \
                                              rank_, n, k);                      \
     } while(0)
-            if(world_size_ == 2) { LAUNCH_LAST_1250(2); }
-            else                 { LAUNCH_LAST_1250(4); }
+            DISPATCH_NGPUS_1250(world_size_, LAUNCH_LAST_1250);
 #undef LAUNCH_LAST_1250
             break;
         }
@@ -1518,8 +1511,7 @@ public:
                 <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, output,       \
                                              rank_, m, n, k);                   \
     } while(0)
-            if(world_size_ == 2) { LAUNCH_MID_1250(2); }
-            else                 { LAUNCH_MID_1250(4); }
+            DISPATCH_NGPUS_1250(world_size_, LAUNCH_MID_1250);
 #undef LAUNCH_MID_1250
             break;
         }

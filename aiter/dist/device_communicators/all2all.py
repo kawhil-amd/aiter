@@ -28,7 +28,15 @@ def has_mori() -> bool:
 class MoriAll2AllManager(All2AllManagerBase):
     @staticmethod
     def _init_mori_shmem(cpu_group) -> None:
-        """Register *cpu_group* with mori's shmem heap and run the barrier."""
+        """Register *cpu_group* with mori's shmem heap and run the barrier.
+
+        Skipped on gfx125x where the EP backend uses CCO (v2) — shmem is
+        unnecessary and its init can hang.
+        """
+        from aiter.jit.utils.chip_info import get_gfx
+
+        if get_gfx().startswith("gfx125"):
+            return
         import mori
 
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
@@ -57,6 +65,7 @@ class MoriAll2AllManager(All2AllManagerBase):
         num_local_experts: int,
         num_experts_per_token: int,
         gpu_per_node: int,
+        quant_type: str = "none",
     ):
         import mori  # type: ignore[import-not-found]
 
@@ -89,6 +98,9 @@ class MoriAll2AllManager(All2AllManagerBase):
             "kernel_type": kernel_type,
             "rdma_block_num": rdma_block_num,
             "gpu_per_node": gpu_per_node,
+            # Combine-side codec. MoRI defaults this to "none" (bf16 on the wire);
+            # "fp8_blockwise" picks the EpCombineIntraNodeKernel_*_fp8bwq_* kernels.
+            "quant_type": quant_type,
         }
 
     def _make_handle(self, **kwargs):
@@ -123,7 +135,14 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
 
     @staticmethod
     def _init_mori_shmem(cpu_group) -> None:
-        """Register *cpu_group* with mori's shmem heap and run the barrier."""
+        """Register *cpu_group* with mori's shmem heap and run the barrier.
+
+        Skipped on gfx125x where the EP backend uses CCO (v2).
+        """
+        from aiter.jit.utils.chip_info import get_gfx
+
+        if get_gfx().startswith("gfx125"):
+            return
         import mori
 
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
@@ -165,8 +184,6 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
                 "backend."
             )
 
-        # FlyDSL uses mori.shmem for P2P buffer allocation internally.
-        # Keep shmem init behavior aligned with MoriAll2AllManager.
         self._init_mori_shmem(cpu_group)
         self.handle_cache = Cache()
 
