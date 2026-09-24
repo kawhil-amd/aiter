@@ -25,10 +25,28 @@ def has_mori() -> bool:
     return _has_module("mori")
 
 
+def _is_gfx125x() -> bool:
+    """Runtime arch check for the EP backend.
+
+    Not custom_all_reduce's _detect_gfx1250: that one honours
+    AITER_CUSTOM_AR_DISABLE_GFX1250, and forcing the old custom-AR path should
+    not change which backend mori's EP handle picks.
+    """
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    return get_gfx_runtime().startswith("gfx125")
+
+
 class MoriAll2AllManager(All2AllManagerBase):
     @staticmethod
     def _init_mori_shmem(cpu_group) -> None:
-        """Register *cpu_group* with mori's shmem heap and run the barrier."""
+        """Register *cpu_group* with mori's shmem heap and run the barrier.
+
+        Skipped on gfx125x: that arch has no shmem support, so mori's EP
+        backend there is CCO. Running this init would be useless and can hang.
+        """
+        if _is_gfx125x():
+            return
         import mori
 
         torch._C._distributed_c10d._register_process_group("mori", cpu_group)
@@ -57,6 +75,7 @@ class MoriAll2AllManager(All2AllManagerBase):
         num_local_experts: int,
         num_experts_per_token: int,
         gpu_per_node: int,
+        quant_type: str = "none",
     ):
         import mori  # type: ignore[import-not-found]
 
@@ -89,6 +108,9 @@ class MoriAll2AllManager(All2AllManagerBase):
             "kernel_type": kernel_type,
             "rdma_block_num": rdma_block_num,
             "gpu_per_node": gpu_per_node,
+            # Combine-side codec. MoRI defaults this to "none" (bf16 on the wire);
+            # "fp8_blockwise" picks the EpCombineIntraNodeKernel_*_fp8bwq_* kernels.
+            "quant_type": quant_type,
         }
 
     def _make_handle(self, **kwargs):

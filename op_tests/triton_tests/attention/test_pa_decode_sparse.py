@@ -9,6 +9,7 @@ import triton
 
 from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import checkAllclose
 
 
@@ -311,18 +312,14 @@ def test_pa_decode_sparse_vs_reference(
     )
 
 
-# ---------------------------------------------------------------------------
-# FP8 KV cache quantization helpers
-# ---------------------------------------------------------------------------
-
 _FP8_GROUP_SIZE = 64
-_FP8_DTYPE = torch.float8_e4m3fnuz
+_FP8_DTYPE = get_fp8_e4m3_dtype()
 
 
 def _quantize_kv_fp8(unified_kv, group_size=_FP8_GROUP_SIZE):
     """Quantize bf16/fp16 unified_kv to (fp8, scales) with 1xGROUP_SIZE block scaling.
 
-    Returns (kv_fp8, kv_scales) where kv_fp8 is float8_e4m3fnuz and
+    Returns (kv_fp8, kv_scales) where kv_fp8 is _FP8_DTYPE and
     kv_scales is [total_pages, D // group_size] fp32.
     """
     total_pages, D = unified_kv.shape
@@ -434,6 +431,29 @@ def make_packed_cache(num_tokens, D, dtype):
     return cache, kv_deq.reshape(nb * block, D)
 
 
+def widen_to_int32_overflow(cache, kv_deq):
+    """Re-lay ``cache`` as a strided view whose span exceeds a 32-bit offset.
+
+    Same nelement() and same contents, but the dim-0 pitch is stretched so the
+    last block sits past 2**31 bytes. Only the blocks themselves are written;
+    the padding between them is left uninitialised, so the pool costs its
+    address space but not the time to fill it.
+    """
+    nb, block, row = cache.shape
+    itemsize = cache.element_size()
+    pitch = triton.cdiv(2**31, max(1, nb - 1) * itemsize)
+    pitch = max(pitch, block * row)
+    # the packed fp8 cache is viewed as bfloat16, which needs an even stride
+    pitch += pitch % 2
+    pool = torch.empty(
+        pitch * (nb - 1) + block * row, dtype=cache.dtype, device=cache.device
+    )
+    view = pool.as_strided((nb, block, row), (pitch, row, 1))
+    view.copy_(cache)
+    assert view.stride(0) * itemsize * (nb - 1) >= 2**31
+    return view, kv_deq
+
+
 def two_loop_reference(
     q,
     main_deq,
@@ -475,7 +495,8 @@ def two_loop_reference(
 @pytest.mark.parametrize("main_len", [128])
 @pytest.mark.parametrize("extra_len", [8, 256])
 @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
-def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype):
+@pytest.mark.parametrize("strided_cache", [False, True])
+def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype, strided_cache):
     """gfx950 vLLM DSv4 decode path: SWA (main) + top-k (extra) two-loop over
     packed caches. fp8 (fp8_ds_mla) is the vLLM production format; bf16 is also
     exercised. Skipped off gfx950 (extra_* is a packed-only gluon path)."""
@@ -483,6 +504,14 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype):
         pytest.skip("CUDA required")
     if arch_info.get_arch() != "gfx950":
         pytest.skip("two-loop (extra_*) is a gfx950 packed-cache-only path")
+    if strided_cache:
+        # The pool has to span >2 GiB for the offsets to overflow, so pin the
+        # regression to one shape -- the fp8 production format at the largest T
+        # -- rather than paying it on all 24 combinations.
+        if dtype != "fp8" or T != 128:
+            pytest.skip("strided-cache case is pinned to the fp8 T=128 shape")
+        if torch.cuda.mem_get_info()[0] < 4 * 1024**3:
+            pytest.skip("needs ~3 GiB free for the >2 GiB strided pool")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -502,6 +531,8 @@ def test_pa_decode_sparse_two_loop(T, H, D, main_len, extra_len, dtype):
     # extra = scattered top-k over a pool
     extra_pool = T * extra_len
     extra_cache, extra_deq = make_packed_cache(extra_pool, D, dtype)
+    if strided_cache:
+        extra_cache, extra_deq = widen_to_int32_overflow(extra_cache, extra_deq)
     extra_idx = torch.randint(
         0, extra_pool, (T, extra_len), device=device, dtype=torch.int32
     ).reshape(-1)
